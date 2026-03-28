@@ -4797,6 +4797,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lossless-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12364,6 +12382,7 @@ dependencies = [
  "landlock",
  "lettre",
  "libc",
+ "lossless-context",
  "mail-parser",
  "matrix-sdk",
  "mime_guess",

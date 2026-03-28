@@ -3,6 +3,9 @@ pub mod agent;
 pub mod classifier;
 pub mod context_analyzer;
 pub mod context_compressor;
+pub mod context_engine;
+#[cfg(feature = "lossless-context")]
+pub mod lcm_context_engine;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;

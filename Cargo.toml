@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys", "crates/lossless-context", "apps/tauri"]
 resolver = "2"
 
 [package]
@@ -204,6 +204,9 @@ pdf-extract = { version = "0.10", optional = true }
 # WASM plugin runtime (extism)
 extism = { version = "1.20", optional = true }
 
+# Lossless Context Management (DAG-based conversation memory)
+lossless-context = { path = "crates/lossless-context", optional = true }
+
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
 cpal = { version = "0.15", optional = true }
 
@@ -259,6 +262,8 @@ skill-creation = []
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # voice-wake = Voice wake word detection via microphone (cpal)
 voice-wake = ["dep:cpal"]
+# Lossless Context Management (DAG-based conversation memory)
+lossless-context = ["dep:lossless-context"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
 # WebAuthn / FIDO2 hardware key authentication

@@ -112,6 +112,9 @@ mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
+#[cfg(feature = "lossless-context")]
+pub mod lcm;
+
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
 pub use browser::{BrowserTool, ComputerUseConfig};

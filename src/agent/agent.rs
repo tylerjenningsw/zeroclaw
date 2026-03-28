@@ -1,3 +1,4 @@
+use crate::agent::context_engine::{ContextEngine, DefaultContextEngine, TurnContext};
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -45,6 +46,7 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
+    context_engine: Box<dyn ContextEngine>,
     memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
     model_name: String,
@@ -80,6 +82,7 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
+    context_engine: Option<Box<dyn ContextEngine>>,
     memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
     model_name: Option<String>,
@@ -110,6 +113,7 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
+            context_engine: None,
             memory_loader: None,
             config: None,
             model_name: None,
@@ -159,6 +163,11 @@ impl AgentBuilder {
 
     pub fn tool_dispatcher(mut self, tool_dispatcher: Box<dyn ToolDispatcher>) -> Self {
         self.tool_dispatcher = Some(tool_dispatcher);
+        self
+    }
+
+    pub fn context_engine(mut self, context_engine: Box<dyn ContextEngine>) -> Self {
+        self.context_engine = Some(context_engine);
         self
     }
 
@@ -297,6 +306,9 @@ impl AgentBuilder {
             tool_dispatcher: self
                 .tool_dispatcher
                 .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
+            context_engine: self
+                .context_engine
+                .unwrap_or_else(|| Box::new(DefaultContextEngine)),
             memory_loader: self
                 .memory_loader
                 .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
@@ -344,6 +356,17 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Bootstrap the context engine with the current in-memory history.
+    ///
+    /// Called from the gateway after `seed_history()`.  Runs unconditionally
+    /// so the engine can recover its own persisted state even when the session
+    /// backend has no messages.
+    pub async fn bootstrap_context_engine(&mut self) -> Result<()> {
+        self.context_engine
+            .bootstrap(self.memory_session_id.as_deref(), &self.history)
+            .await
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -775,11 +798,17 @@ impl Agent {
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+        let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
 
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let messages = self.context_engine.assemble(
+                self.memory_session_id.as_deref(),
+                self.config.max_context_tokens,
+                self.tool_dispatcher.as_ref(),
+                &self.history,
+            ).await?;
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -813,7 +842,12 @@ impl Agent {
                         .push(ConversationMessage::Chat(ChatMessage::assistant(
                             cached.clone(),
                         )));
+                    let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
                     self.trim_history();
+                    let _ = self.context_engine.after_turn(
+                        self.memory_session_id.as_deref(),
+                        &TurnContext { model: &effective_model, max_context_tokens: self.config.max_context_tokens },
+                    ).await;
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -864,7 +898,12 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
                 self.trim_history();
+                let _ = self.context_engine.after_turn(
+                    self.memory_session_id.as_deref(),
+                    &TurnContext { model: &effective_model, max_context_tokens: self.config.max_context_tokens },
+                ).await;
 
                 return Ok(final_text);
             }
@@ -874,6 +913,7 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         text.clone(),
                     )));
+                let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
                 print!("{text}");
                 let _ = std::io::stdout().flush();
             }
@@ -883,10 +923,12 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
                 reasoning_content: response.reasoning_content.clone(),
             });
+            let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
 
             let results = self.execute_tools(&calls).await;
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
+            let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
             self.trim_history();
         }
 
@@ -949,12 +991,18 @@ impl Agent {
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+        let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
 
         let effective_model = self.classify_model(user_message);
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            let messages = self.context_engine.assemble(
+                self.memory_session_id.as_deref(),
+                self.config.max_context_tokens,
+                self.tool_dispatcher.as_ref(),
+                &self.history,
+            ).await?;
 
             // Response cache check (same as turn)
             let cache_key = if self.temperature == 0.0 {
@@ -988,7 +1036,12 @@ impl Agent {
                         .push(ConversationMessage::Chat(ChatMessage::assistant(
                             cached.clone(),
                         )));
+                    let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
                     self.trim_history();
+                    let _ = self.context_engine.after_turn(
+                        self.memory_session_id.as_deref(),
+                        &TurnContext { model: &effective_model, max_context_tokens: self.config.max_context_tokens },
+                    ).await;
                     return Ok(cached);
                 }
                 self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -1139,7 +1192,12 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
                 self.trim_history();
+                let _ = self.context_engine.after_turn(
+                    self.memory_session_id.as_deref(),
+                    &TurnContext { model: &effective_model, max_context_tokens: self.config.max_context_tokens },
+                ).await;
 
                 return Ok(final_text);
             }
@@ -1150,6 +1208,7 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         text.clone(),
                     )));
+                let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
             }
 
             self.history.push(ConversationMessage::AssistantToolCalls {
@@ -1157,6 +1216,7 @@ impl Agent {
                 tool_calls: response.tool_calls.clone(),
                 reasoning_content: response.reasoning_content.clone(),
             });
+            let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
 
             // Notify about each tool call
             for call in &calls {
@@ -1182,6 +1242,7 @@ impl Agent {
 
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
+            let _ = self.context_engine.ingest(self.memory_session_id.as_deref(), self.history.last().unwrap()).await;
             self.trim_history();
         }
 

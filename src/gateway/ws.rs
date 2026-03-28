@@ -212,6 +212,12 @@ async fn handle_socket(
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
     }
+    // Always bootstrap the context engine — even if session_backend is None or had
+    // no messages.  The engine may have its own persisted data for this session_id
+    // from a prior WebSocket connection.
+    if let Err(e) = agent.bootstrap_context_engine().await {
+        tracing::warn!(error = %e, "Context engine bootstrap failed");
+    }
 
     // Send session_start message to client
     let mut session_start = serde_json::json!({
