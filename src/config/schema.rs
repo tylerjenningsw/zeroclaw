@@ -1369,6 +1369,14 @@ pub struct AgentConfig {
     /// middle. Set to `0` to disable truncation. Default: `50000`.
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
+
+    /// Lossless Context Management (LCM) configuration. When `enabled`, LCM
+    /// persists messages to SQLite, summarizes on compaction, and exposes
+    /// `lcm_grep` / `lcm_describe` / `lcm_expand_query` tools to the agent.
+    /// Defaults to disabled.
+    #[cfg(feature = "lossless-context")]
+    #[serde(default)]
+    pub lcm: lossless_context::LcmConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1415,6 +1423,8 @@ impl Default for AgentConfig {
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
+            #[cfg(feature = "lossless-context")]
+            lcm: lossless_context::LcmConfig::default(),
         }
     }
 }

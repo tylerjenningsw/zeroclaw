@@ -73,6 +73,12 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Shared session-id handle for LCM tools (`lcm_grep`, `lcm_expand_query`).
+    /// Populated via `attach_lcm_session_handle()` after `from_config()` builds
+    /// the agent; write-through from `set_memory_session_id_async()` keeps the
+    /// tools scoped to the current conversation even across session overrides.
+    #[cfg(feature = "lossless-context")]
+    lcm_session_handle: Option<Arc<tokio::sync::Mutex<Option<String>>>>,
 }
 
 pub struct AgentBuilder {
@@ -337,6 +343,8 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            #[cfg(feature = "lossless-context")]
+            lcm_session_handle: None,
         })
     }
 }
@@ -356,6 +364,37 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Async variant that, in addition to updating `memory_session_id`,
+    /// write-throughs the shared LCM session-id handle so the LCM tools
+    /// (`lcm_grep`, `lcm_expand_query`) scope their reads to the correct
+    /// conversation. Call this from async contexts (e.g. the WebSocket
+    /// gateway). Sync callers can keep using `set_memory_session_id`.
+    pub async fn set_memory_session_id_async(&mut self, session_id: Option<String>) {
+        self.set_memory_session_id(session_id.clone());
+        #[cfg(feature = "lossless-context")]
+        if let Some(handle) = &self.lcm_session_handle {
+            let mut guard = handle.lock().await;
+            *guard = session_id;
+        }
+        #[cfg(not(feature = "lossless-context"))]
+        let _ = session_id; // silence unused warning when LCM is off
+    }
+
+    /// Install the shared LCM session-id handle constructed in `from_config()`.
+    /// Primes the handle with the current `memory_session_id` so tools don't
+    /// observe `None` on the first call before the gateway writes.
+    #[cfg(feature = "lossless-context")]
+    pub async fn attach_lcm_session_handle(
+        &mut self,
+        handle: Arc<tokio::sync::Mutex<Option<String>>>,
+    ) {
+        {
+            let mut guard = handle.lock().await;
+            *guard = self.memory_session_id.clone();
+        }
+        self.lcm_session_handle = Some(handle);
     }
 
     /// Bootstrap the context engine with the current in-memory history.
@@ -550,7 +589,196 @@ impl Agent {
             None
         };
 
-        Agent::builder()
+        // ── Lossless Context Management (LCM) — optional, feature-gated ─
+        // When enabled, LCM replaces the DefaultContextEngine with a SQLite-
+        // backed engine that persists every message, runs summarization on
+        // compaction, and registers three retrieval tools (lcm_grep /
+        // lcm_describe / lcm_expand_query).
+        //
+        // Fail-open: any LCM construction error logs a warning/error and
+        // falls back to the default (LCM disabled for this session), so a
+        // bad compaction_model never takes down the daemon.
+        #[cfg(feature = "lossless-context")]
+        let (lcm_context_engine, lcm_extra_tools, lcm_session_handle): (
+            Option<Box<dyn ContextEngine>>,
+            Vec<Box<dyn Tool>>,
+            Option<Arc<tokio::sync::Mutex<Option<String>>>>,
+        ) = if config.agent.lcm.enabled {
+            // Deprecation warning: expansion_model is plumbed through the
+            // same SummarizeFn as compaction for now. See plan A.3.2.
+            if config.agent.lcm.expansion_model.is_some() {
+                tracing::warn!(
+                    "config.agent.lcm.expansion_model is set but not yet honored; \
+                     expand_query currently uses compaction_model. Ignoring."
+                );
+            }
+
+            'lcm: {
+                use crate::agent::lcm_context_engine::LcmContextEngine;
+                use crate::tools::lcm::build_lcm_tools;
+                use lossless_context::{LcmDatabase, LcmEngine};
+                use tokio::sync::Mutex as TokioMutex;
+
+                // DB path: honor explicit override, else default to
+                // {workspace_dir}/lcm.db.
+                let db_path = config
+                    .agent
+                    .lcm
+                    .database_path
+                    .clone()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| config.workspace_dir.join("lcm.db"));
+                if let Some(parent) = db_path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        tracing::error!(
+                            error = %e,
+                            path = %parent.display(),
+                            "LCM: failed to create database parent directory; disabling LCM"
+                        );
+                        break 'lcm (None, Vec::new(), None);
+                    }
+                }
+                let db = match LcmDatabase::open(&db_path) {
+                    Ok(db) => Arc::new(db),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %db_path.display(),
+                            "LCM: failed to open SQLite database; disabling LCM"
+                        );
+                        break 'lcm (None, Vec::new(), None);
+                    }
+                };
+                let engine = match LcmEngine::with_db(config.agent.lcm.clone(), db) {
+                    Ok(engine) => Arc::new(engine),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "LCM: engine construction failed; disabling LCM"
+                        );
+                        break 'lcm (None, Vec::new(), None);
+                    }
+                };
+
+                // Shared session-id handle; attached to the Agent after
+                // build so set_memory_session_id_async() can write-through.
+                let session_handle: Arc<TokioMutex<Option<String>>> =
+                    Arc::new(TokioMutex::new(None));
+
+                // Dedicated second provider for the summarize closure — the
+                // agent's own provider is Box<dyn Provider> and not Clone.
+                // Fail-open: if compaction_model is bad, warn and retry with
+                // the main model_name; if that also fails, disable LCM.
+                let requested_model = config
+                    .agent
+                    .lcm
+                    .compaction_model
+                    .clone()
+                    .unwrap_or_else(|| model_name.clone());
+                let (summary_provider_box, summarize_model): (Box<dyn Provider>, String) = {
+                    let first = providers::create_routed_provider_with_options(
+                        provider_name,
+                        config.api_key.as_deref(),
+                        config.api_url.as_deref(),
+                        &config.reliability,
+                        &config.model_routes,
+                        &requested_model,
+                        &provider_runtime_options,
+                    );
+                    match first {
+                        Ok(p) => (p, requested_model),
+                        Err(e) if requested_model != model_name => {
+                            tracing::warn!(
+                                error = %e,
+                                requested = %requested_model,
+                                fallback = %model_name,
+                                "LCM compaction_model unavailable; falling back to main model"
+                            );
+                            match providers::create_routed_provider_with_options(
+                                provider_name,
+                                config.api_key.as_deref(),
+                                config.api_url.as_deref(),
+                                &config.reliability,
+                                &config.model_routes,
+                                &model_name,
+                                &provider_runtime_options,
+                            ) {
+                                Ok(p) => (p, model_name.clone()),
+                                Err(e2) => {
+                                    tracing::error!(
+                                        error = %e2,
+                                        "LCM summary provider fallback failed; disabling LCM"
+                                    );
+                                    break 'lcm (None, Vec::new(), None);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "LCM summary provider construction failed; disabling LCM"
+                            );
+                            break 'lcm (None, Vec::new(), None);
+                        }
+                    }
+                };
+
+                // Box<dyn Provider> → Arc<dyn Provider> via std blanket impl
+                // so the Fn closure can cheaply clone a handle.
+                let summary_provider: Arc<dyn Provider> = Arc::from(summary_provider_box);
+
+                let summarize_fn: lossless_context::SummarizeFn = {
+                    let p = Arc::clone(&summary_provider);
+                    let m = summarize_model.clone();
+                    Arc::new(
+                        move |system: String,
+                              user: String,
+                              temperature: f64,
+                              _max_tokens: usize| {
+                            let p = Arc::clone(&p);
+                            let m = m.clone();
+                            Box::pin(async move {
+                                p.chat_with_system(Some(&system), &user, &m, temperature)
+                                    .await
+                            })
+                        },
+                    )
+                };
+
+                let mut engine_impl = LcmContextEngine::new(Arc::clone(&engine));
+                engine_impl.set_summarize_fn(summarize_fn.clone());
+
+                let lcm_tools = build_lcm_tools(
+                    Arc::clone(&engine),
+                    summarize_fn,
+                    Arc::clone(&session_handle),
+                );
+
+                tracing::info!(
+                    db_path = %db_path.display(),
+                    summarize_model = %summarize_model,
+                    "LCM engine initialized"
+                );
+
+                (
+                    Some(Box::new(engine_impl) as Box<dyn ContextEngine>),
+                    lcm_tools,
+                    Some(session_handle),
+                )
+            }
+        } else {
+            (None, Vec::new(), None)
+        };
+
+        #[cfg(not(feature = "lossless-context"))]
+        let lcm_context_engine: Option<Box<dyn ContextEngine>> = None;
+        #[cfg(not(feature = "lossless-context"))]
+        let lcm_extra_tools: Vec<Box<dyn Tool>> = Vec::new();
+
+        // Merge LCM tools into the main tool list (already mut from MCP path).
+        tools.extend(lcm_extra_tools);
+
+        let mut builder = Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
@@ -578,8 +806,21 @@ impl Agent {
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
-            .activated_tools(activated_tools)
-            .build()
+            .activated_tools(activated_tools);
+        if let Some(engine) = lcm_context_engine {
+            builder = builder.context_engine(engine);
+        }
+        // `mut` is needed under feature = "lossless-context" for the
+        // attach_lcm_session_handle call below; silence the warning when off.
+        #[cfg_attr(not(feature = "lossless-context"), allow(unused_mut))]
+        let mut agent = builder.build()?;
+
+        #[cfg(feature = "lossless-context")]
+        if let Some(handle) = lcm_session_handle {
+            agent.attach_lcm_session_handle(handle).await;
+        }
+
+        Ok(agent)
     }
 
     fn trim_history(&mut self) {

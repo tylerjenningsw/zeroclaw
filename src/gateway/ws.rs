@@ -187,7 +187,7 @@ async fn handle_socket(
             return;
         }
     };
-    agent.set_memory_session_id(Some(session_id.clone()));
+    agent.set_memory_session_id_async(Some(session_id.clone())).await;
 
     // Hydrate agent from persisted session (if available)
     let mut resumed = false;
@@ -254,7 +254,7 @@ async fn handle_socket(
                         );
                         // Override session_id if provided in connect params
                         if let Some(sid) = &cp.session_id {
-                            agent.set_memory_session_id(Some(sid.clone()));
+                            agent.set_memory_session_id_async(Some(sid.clone())).await;
                         }
                         let ack = serde_json::json!({
                             "type": "connected",

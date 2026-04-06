@@ -1,9 +1,10 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Lossless Context Management configuration.
 ///
 /// Defaults match the upstream TypeScript `openclaw.plugin.json` schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct LcmConfig {
     pub enabled: bool,
